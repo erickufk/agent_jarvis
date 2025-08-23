@@ -1,0 +1,15 @@
+# .env.example
+# Copy this file to .env and fill in your actual values.
+
+
+OPENROUTER_API_KEY=sk
+OPENROUTER_REFERER=http://localhost:7860
+OPENROUTER_TITLE=Local Task Agent
+
+# OCR / PDF (optional)
+TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
+OCR_LANGS=eng
+POPPLER_PATH=C:\tools\poppler\Library\bin
+
+# --- Huggingface ---
+HF_TOKEN=hf_

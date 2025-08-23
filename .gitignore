@@ -1,0 +1,4 @@
+.env
+__pycache__/agent_core.cpython-311.pyc
+__pycache__/app_config.cpython-311.pyc
+__pycache__/tools_local.cpython-311.pyc
