@@ -1,12 +1,19 @@
-gradio>=4.36
-python-dotenv>=1.0
-smolagents>=0.6
-openai>=1.30
-litellm>=1.42
-pypdf>=4.2
-pdf2image>=1.17
-pytesseract>=0.3.10
-Pillow>=10.3
-python-docx>=1.1
-openpyxl>=3.1
-chardet>=5.2
+# UI + env
+gradio==4.42.0
+python-dotenv==1.0.1
+
+# Agent + model routing
+smolagents==0.6.2          # has CodeAgent + LiteLLMModel/OpenAI server support
+openai==1.40.6             # OpenAI-compatible SDK (used for OR/HF/Ollama routes)
+litellm==1.45.12           # router abstraction; stable with smolagents 0.6.x
+
+# File readers
+pypdf==4.2.0
+python-docx==1.1.2
+openpyxl==3.1.5
+chardet==5.2.0
+
+# OCR & images
+pdf2image==1.17.0          # needs Poppler installed on the OS
+pytesseract==0.3.10        # needs Tesseract installed on the OS
+Pillow==10.4.0
