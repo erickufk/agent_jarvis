@@ -1,7 +1,7 @@
-# agent_core.py
-"""
+"""agent_core.py
 Core agent logic: model factory, prompt, cache/reset, and run wrapper.
 The Gradio UI imports helpers from here.
+Author: Uriel Kaiia (kaya.uf@gmail.com)
 
 Backends supported:
 - API (OpenRouter)  -> uses LiteLLMModel with api_base=https://openrouter.ai/api/v1

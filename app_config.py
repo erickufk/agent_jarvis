@@ -1,5 +1,6 @@
 """app_config.py
 Central configuration: provider defaults and theme.
+Author: Uriel Kaiia (kaya.uf@gmail.com)
 
 We keep a single source of truth for model names per provider in
 MODEL_BY_BACKEND, and also export legacy constants for UI back-compat.

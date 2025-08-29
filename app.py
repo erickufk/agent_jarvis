@@ -1,5 +1,6 @@
 """app.py
 UI entry point (Gradio). Only UI logic lives here.
+Author: Uriel Kaiia (kaya.uf@gmail.com)
 """
 import gradio as gr
 from pathlib import Path

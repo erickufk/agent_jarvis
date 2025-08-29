@@ -1,6 +1,7 @@
-# tools_local.py
-"""
+"""tools_local.py
 Local tool implementations.
+Author: Uriel Kaiia (kaya.uf@gmail.com)
+
 
 All custom tools and sandbox utilities (e.g., file I/O, OS helpers)
 are defined here, following the MCP-style separation of concerns.
