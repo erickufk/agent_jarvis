@@ -1,14 +1,9 @@
-"""tools_local.py
+# tools_local.py
+"""
 Local tool implementations.
 
-All custom tools and sandbox utilities (e.g., file/O, OS helpers)
-are defined here, following the MCP‑style separation of concerns.
-"""
-
-
-"""
-All tools live here, separate from the UI.
-They are sandboxed to ACTION_ROOT. The UI sets ACTION_ROOT via setters below.
+All custom tools and sandbox utilities (e.g., file I/O, OS helpers)
+are defined here, following the MCP-style separation of concerns.
 
 Design:
 - ACTION_ROOT: global sandbox folder the agent can touch
@@ -16,13 +11,13 @@ Design:
 - get_tools(safe_mode): returns list of @tool functions (no shell in safe mode)
 """
 
-
 from pathlib import Path
-from typing import Union, List, Optional
-import os, re, io
+from typing import Optional, Iterable
+import os, re
+from collections import Counter
+
 from PIL import Image, ImageOps, ImageFilter
 import pytesseract
-
 from smolagents import tool
 
 # --------- Global sandbox state ----------
@@ -32,9 +27,10 @@ LAST_EXPLORER_PICK: Optional[Path] = None
 # OCR / PDF helpers (env-configurable in app startup)
 DEFAULT_OCR_LANGS = os.getenv("OCR_LANGS", "eng")
 POPPLER_PATH = os.getenv("POPPLER_PATH")  # for pdf2image on Windows
-pytesseract.pytesseract.tesseract_cmd = os.getenv(
-    "TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-)
+# Default Tesseract path (Windows). If set, wire it; otherwise let pytesseract find it.
+_TESS_EXE = os.getenv("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+if os.path.exists(_TESS_EXE):
+    pytesseract.pytesseract.tesseract_cmd = _TESS_EXE
 
 # --------- Folder setters / helpers ----------
 def _extract_path_from_explorer_selection(selected) -> Optional[Path]:
@@ -81,6 +77,7 @@ def set_action_root_from_text(path_str: str) -> str:
     return str(ACTION_ROOT)
 
 def get_action_root() -> str:
+    """Return ACTION_ROOT as a string (for UI)."""
     return str(ACTION_ROOT)
 
 def _normalize_to_root(user_path: str) -> Path:
@@ -90,6 +87,34 @@ def _normalize_to_root(user_path: str) -> Path:
     if ACTION_ROOT == rp or ACTION_ROOT in rp.parents:
         return rp
     raise ValueError(f"Path escapes sandbox: {rp} not under {ACTION_ROOT}")
+
+# ---- dedup helpers for recursive scans (avoid symlink/junction double counts)
+def _excluded(rel_posix: str, exclude_names: set[str]) -> bool:
+    return any(f"/{x}/" in f"/{rel_posix}/" or rel_posix.startswith(f"{x}/") for x in exclude_names)
+
+def _iter_files_unique(base: Path, pattern: str, exclude: Iterable[str]) -> Iterable[Path]:
+    """
+    Yield files under `base` matching `pattern`, excluding listed dir names,
+    de-duplicated by realpath (prevents double-counting via junctions/symlinks).
+    """
+    exclude_names = {x.strip() for x in exclude if x and x.strip()}
+    seen_real = set()
+    it = base.rglob(pattern) if "**" in pattern else base.glob(pattern)
+    for p in it:
+        try:
+            if not p.is_file():
+                continue
+            rel = p.relative_to(ACTION_ROOT).as_posix()
+            if _excluded(rel, exclude_names):
+                continue
+            real = p.resolve(strict=False)
+            key = str(real).lower()  # lower() to avoid Win case dupes
+            if key in seen_real:
+                continue
+            seen_real.add(key)
+            yield p
+        except Exception:
+            continue
 
 # --------- General tools ----------
 @tool
@@ -144,20 +169,35 @@ def read_text(path: str, max_chars: int = 20000) -> str:
         return f"error:{e}"
 
 @tool
-def list_dir(path: str = ".", glob_pattern: str = "*") -> str:
+def list_dir(path: str = ".", glob_pattern: str = "*", exclude: str = "") -> str:
     """List files/folders that match a glob pattern.
 
     Args:
         path (str): Subfolder under the action folder.
         glob_pattern (str): Glob to match (e.g., '*.md', '**/*.py').
+        exclude (str): Comma-separated dir names to skip anywhere in the path.
 
     Returns:
         str: Matches relative to action folder, or '(no matches)'.
     """
     try:
         base = _normalize_to_root(path)
-        items = [str(p.relative_to(ACTION_ROOT)) for p in base.glob(glob_pattern)]
-        return "\n".join(items) if items else "(no matches)"
+        exclude_names = {x.strip() for x in exclude.split(",") if x.strip()}
+        # files (deduped)
+        files = [
+            str(p.relative_to(ACTION_ROOT))
+            for p in _iter_files_unique(base, glob_pattern, exclude_names)
+        ]
+        # dirs (non-deduped, just to show structure)
+        dirs = []
+        it = base.rglob(glob_pattern) if "**" in glob_pattern else base.glob(glob_pattern)
+        for p in it:
+            if p.is_dir():
+                rel = p.relative_to(ACTION_ROOT).as_posix()
+                if not _excluded(rel, exclude_names):
+                    dirs.append(rel)
+        out = sorted(set(files)) + sorted(set(dirs))
+        return "\n".join(out) if out else "(no matches)"
     except Exception as e:
         return f"error:{e}"
 
@@ -168,12 +208,14 @@ def search_text(path: str = ".", glob_pattern: str = "**/*", query: str = "", ma
     Args:
         path (str): Subfolder under the action folder.
         glob_pattern (str): File glob to include (e.g., '**/*.py').
-        query (str): Regular expression (case-insensitive).
+        query (str): Regular expression (case-insensitive). Must be non-empty.
         max_hits (int): Max number of matched lines.
 
     Returns:
-        str: '<relative-path>:<line-no>: <line>' or '(no hits)'.
+        str: '<relative-path>:<line-no>: <line>' lines or '(no hits)' / 'error:<msg>'.
     """
+    if not query or not query.strip():
+        return "error: query must be a non-empty regex"
     try:
         rx = re.compile(query, re.IGNORECASE)
         root = _normalize_to_root(path)
@@ -239,6 +281,45 @@ def sh(cmd: str, shell: str = "auto") -> str:
 
 # --------- Document formats ----------
 @tool
+def read_pdf_auto(
+    path: str,
+    max_pages: int = 10,
+    dpi: int = 300,
+    lang: str = "",
+    preprocess: str = "auto",
+    max_chars: int = 20000,
+) -> str:
+    """Extract text from a PDF with an automatic fallback to OCR.
+
+    Args:
+        path (str): PDF path under the action folder (relative to ACTION_ROOT).
+        max_pages (int): Max pages to process from the start (for both modes).
+        dpi (int): Render DPI used by OCR fallback (suggest 300–400).
+        lang (str): Tesseract languages for OCR (e.g., 'eng+rus'); falls back to OCR_LANGS env or 'eng'.
+        preprocess (str): Image preprocessing for OCR: 'auto'|'none'|'strong'.
+        max_chars (int): Truncate the total returned text to this many characters.
+
+    Returns:
+        str: Extracted text (possibly truncated), '(no extractable text)', or 'error:<message>'.
+
+    Notes:
+        This tool first tries native text extraction via `read_pdf`. If that yields
+        no text, it falls back to `read_pdf_ocr` (Tesseract + Poppler).
+    """
+    try:
+        # 1) Try native text
+        txt = read_pdf(path=path, max_pages=max_pages)  # returns "(no extractable text)" if scanned
+        if isinstance(txt, str) and txt.strip() and "(no extractable text)" not in txt:
+            return txt[:max_chars]
+
+        # 2) Fallback to OCR
+        return read_pdf_ocr(
+            path=path, max_pages=max_pages, dpi=dpi,
+            lang=lang, preprocess=preprocess, max_chars=max_chars
+        )
+    except Exception as e:
+        return f"error:{e}"
+
 def read_pdf(path: str, max_pages: int = 20) -> str:
     """Extract text from a non-scanned PDF (no OCR).
 
@@ -247,7 +328,7 @@ def read_pdf(path: str, max_pages: int = 20) -> str:
         max_pages (int): Max pages to extract.
 
     Returns:
-        str: Text or 'error:<message>'.
+        str: Text or '(no extractable text)' or 'error:<message>'.
     """
     try:
         from pypdf import PdfReader
@@ -255,48 +336,93 @@ def read_pdf(path: str, max_pages: int = 20) -> str:
         reader = PdfReader(str(target))
         pages = []
         for i, page in enumerate(reader.pages):
-            if i >= max_pages: break
+            if i >= max_pages:
+                break
             pages.append(page.extract_text() or "")
         txt = "\n\n".join(pages).strip()
         return txt if txt else "(no extractable text)"
     except Exception as e:
         return f"error:{e}"
 
-@tool
-def read_pdf_ocr(path: str, max_pages: int = 10, dpi: int = 300, lang: str = "", preprocess: str = "auto", max_chars: int = 20000) -> str:
+def read_pdf_ocr(
+    path: str,
+    max_pages: int = 10,
+    dpi: int = 300,
+    lang: str = "",
+    preprocess: str = "auto",
+    max_chars: int = 20000,
+) -> str:
     """OCR a scanned PDF by rendering pages to images then running Tesseract.
 
     Args:
-        path (str): PDF path under action folder.
-        max_pages (int): Max pages from start.
-        dpi (int): Render DPI for OCR (300–400 for quality).
-        lang (str): Tesseract languages (e.g., 'eng+rus').
-        preprocess (str): 'auto'|'none'|'strong'.
-        max_chars (int): Truncate output length.
+        path (str): PDF path under action folder (relative to ACTION_ROOT).
+        max_pages (int): Max pages from start; <=0 means ALL pages.
+        dpi (int): Render DPI for OCR (suggest 300–400).
+        lang (str): Tesseract languages (e.g., 'eng+rus'); falls back to OCR_LANGS env or 'eng'.
+        preprocess (str): 'auto'|'none'|'strong' (strong adds binarization).
+        max_chars (int): Truncate total output to this many characters.
 
     Returns:
-        str: Extracted text (maybe truncated) or 'error:<message>'.
+        str: Extracted text (maybe truncated) or '(no text found)' or 'error:<message>'.
     """
     try:
         from pdf2image import convert_from_path
+
+        # Resolve paths and env defaults
         target = _normalize_to_root(path)
+        poppler_path = POPPLER_PATH or os.getenv("POPPLER_PATH") or None
+        ocr_langs = (lang or os.getenv("OCR_LANGS", "") or DEFAULT_OCR_LANGS).strip() or "eng"
+
+        # Tesseract binary (Windows)
+        tcmd = os.getenv("TESSERACT_CMD")
+        if tcmd:
+            pytesseract.pytesseract.tesseract_cmd = tcmd
+
+        # Clamp sane DPI
+        dpi = max(100, min(int(dpi), 600))
+
+        # pdf2image options
         kwargs = {"dpi": dpi}
-        if POPPLER_PATH: kwargs["poppler_path"] = POPPLER_PATH
+        if poppler_path:
+            kwargs["poppler_path"] = poppler_path
+
+        # If max_pages <= 0 -> process all pages (no last_page bound)
+        if isinstance(max_pages, int) and max_pages > 0:
+            kwargs["first_page"] = 1
+            kwargs["last_page"] = max_pages
+
         images = convert_from_path(str(target), **kwargs)
-        out, langs = [], (lang or DEFAULT_OCR_LANGS).strip() or "eng"
-        for i, img in enumerate(images, 1):
-            if i > max_pages: break
+
+        out_parts = []
+        total = 0
+
+        for i, img in enumerate(images, start=1):
             page = img
             if preprocess != "none":
                 page = ImageOps.grayscale(page)
                 if preprocess in ("auto", "strong"):
                     page = ImageOps.autocontrast(page).filter(ImageFilter.MedianFilter(size=3))
                 if preprocess == "strong":
+                    # Simple thresholding for noisy scans
                     page = page.point(lambda p: 255 if p > 160 else 0)
-            text = pytesseract.image_to_string(page, lang=langs).strip()
-            out.append(f"[page {i}]\n{text}")
-        txt = "\n\n".join(out).strip()
-        return txt[:max_chars] if txt else "(no text found)"
+
+            text = pytesseract.image_to_string(page, lang=ocr_langs)
+            text = (text or "").strip()
+
+            segment = f"[page {i}]\n{text}".strip()
+            if segment:
+                # Truncate progressively to respect max_chars
+                remaining = max_chars - total
+                if remaining <= 0:
+                    break
+                seg_trimmed = segment[: max(0, remaining)]
+                out_parts.append(seg_trimmed)
+                total += len(seg_trimmed)
+                if total >= max_chars:
+                    break
+
+        final_txt = "\n\n".join(out_parts).strip()
+        return final_txt if final_txt else "(no text found)"
     except Exception as e:
         return f"error:{e}"
 
@@ -311,7 +437,7 @@ def read_image_ocr(path: str, lang: str = "", preprocess: str = "auto", max_char
         max_chars (int): Truncate output.
 
     Returns:
-        str: Extracted text or 'error:<message>'.
+        str: Extracted text or '(no text found)' or 'error:<message>'.
     """
     try:
         target = _normalize_to_root(path)
@@ -329,22 +455,62 @@ def read_image_ocr(path: str, lang: str = "", preprocess: str = "auto", max_char
         return f"error:{e}"
 
 @tool
-def read_docx(path: str, max_chars: int = 20000) -> str:
-    """Extract text from a DOCX file.
+def read_docx(path: str, max_chars: int = 80000) -> str:
+    """Read a .docx and return text with headings/lists preserved (Markdown-ish).
 
     Args:
-        path (str): DOCX path under action folder.
-        max_chars (int): Truncate length.
+        path (str): .docx path under the action folder (relative to ACTION_ROOT).
+        max_chars (int): Truncate total output.
 
     Returns:
-        str: Text or 'error:<message>'.
+        str: Text content (maybe truncated) or '(no text found)' or 'error:<message>'.
     """
     try:
-        import docx
+        from docx import Document
         target = _normalize_to_root(path)
-        doc = docx.Document(str(target))
-        text = "\n".join(p.text for p in doc.paragraphs) or ""
-        return text[:max_chars] if text else "(empty docx)"
+        doc = Document(str(target))
+
+        def _is_list(para):
+            ppr = getattr(para._p, "pPr", None)
+            return hasattr(ppr, "numPr") and ppr.numPr is not None if ppr is not None else False
+
+        lines, total = [], 0
+        for para in doc.paragraphs:
+            txt = para.text.strip()
+            if not txt:
+                continue
+            style = (para.style.name or "").lower()
+            # Headings
+            if "heading" in style:
+                lvl = 1
+                for n in ("1", "2", "3", "4", "5", "6"):
+                    if n in style:
+                        lvl = int(n); break
+                line = f"{'#'*lvl} {txt}"
+            # Lists
+            elif _is_list(para) or "list" in style:
+                line = f"- {txt}"
+            else:
+                line = txt
+
+            remaining = max_chars - total
+            if remaining <= 0:
+                break
+            line = line[: max(0, remaining)]
+            lines.append(line)
+            total += len(line) + 1
+
+        # Simple table extraction (optional)
+        for tbl in getattr(doc, "tables", []):
+            row_texts = []
+            for row in tbl.rows:
+                cells = [" ".join(p.text for p in cell.paragraphs).strip() for cell in row.cells]
+                row_texts.append("| " + " | ".join(cells) + " |")
+            if row_texts:
+                lines.append("\n".join(row_texts))
+
+        out = "\n".join(lines).strip()
+        return out if out else "(no text found)"
     except Exception as e:
         return f"error:{e}"
 
@@ -354,11 +520,11 @@ def read_xlsx(path: str, sheet: str = None, max_rows: int = 50) -> str:
 
     Args:
         path (str): XLSX path under action folder.
-        sheet (str): Sheet name (None=first).
-        max_rows (int): Max rows.
+        sheet (str): Sheet name to open (None = first sheet).
+        max_rows (int): Max rows to return.
 
     Returns:
-        str: Simple preview or 'error:<message>'.
+        str: Simple preview or '(empty sheet)' or 'error:<message>'.
     """
     try:
         from openpyxl import load_workbook
@@ -367,7 +533,8 @@ def read_xlsx(path: str, sheet: str = None, max_rows: int = 50) -> str:
         ws = wb[sheet] if sheet and sheet in wb.sheetnames else wb[wb.sheetnames[0]]
         rows = []
         for i, row in enumerate(ws.iter_rows(values_only=True), 1):
-            if i > max_rows: break
+            if i > max_rows:
+                break
             rows.append(", ".join("" if v is None else str(v) for v in row))
         wb.close()
         return "\n".join(rows) if rows else "(empty sheet)"
@@ -380,11 +547,11 @@ def read_csv(path: str, delimiter: str = "", max_rows: int = 100) -> str:
 
     Args:
         path (str): CSV path under action folder.
-        delimiter (str): Explicit delimiter (optional).
-        max_rows (int): Max rows.
+        delimiter (str): Explicit delimiter to force (optional).
+        max_rows (int): Max rows to return.
 
     Returns:
-        str: Header + rows or 'error:<message>'.
+        str: Header + rows or '(empty csv)' or 'error:<message>'.
     """
     try:
         import csv
@@ -394,52 +561,100 @@ def read_csv(path: str, delimiter: str = "", max_rows: int = 100) -> str:
         for enc in ("utf-8", "cp1251", "utf-16", "latin-1"):
             try:
                 text = data.decode(enc); break
-            except Exception: continue
-        if text is None: text = data.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+        if text is None:
+            text = data.decode("utf-8", errors="replace")
         sniffer = csv.Sniffer()
         if delimiter:
-            dialect = csv.excel
-            dialect.delimiter = delimiter  # type: ignore[attr-defined]
+            dialect = csv.excel; dialect.delimiter = delimiter  # type: ignore[attr-defined]
         else:
             try:
-                dialect = sniffer.sniff(text.splitlines()[0])
+                first = next((ln for ln in text.splitlines() if ln.strip()), "")
+                dialect = sniffer.sniff(first) if first else csv.excel
             except Exception:
                 dialect = csv.excel
         out, reader = [], csv.reader(text.splitlines(), dialect=dialect)
         for i, row in enumerate(reader):
-            if i > max_rows: break
+            if i > max_rows:
+                break
             out.append(", ".join(row))
         return "\n".join(out) if out else "(empty csv)"
     except Exception as e:
         return f"error:{e}"
 
-from collections import Counter
 @tool
-def count_files_by_type(path: str = ".", glob_pattern: str = "**/*") -> str:
-    """Count files grouped by extension under the action folder.
+def count_files_by_type(
+    path: str = ".",
+    glob_pattern: str = "**/*",
+    exclude: str = ".git,.venv,__pycache__,.ipynb_checkpoints,node_modules,dist,build"
+) -> str:
+    """Count files grouped by extension (deduped) with optional exclusions.
 
     Args:
-        path (str): Subfolder under the action folder.
-        glob_pattern (str): Glob to include (e.g., '**/*').
+        path (str): Subfolder under the action folder where counting begins.
+        glob_pattern (str): Glob pattern to include (e.g., '**/*', '**/*.py').
+        exclude (str): Comma-separated directory names to skip anywhere in paths
+            (e.g., '.git,.venv,__pycache__,node_modules'). These are matched as
+            path segments and excluded from the count.
 
     Returns:
-        str: JSON dict mapping extension (like '.py') to counts, '' for no extension.
+        str: JSON dict mapping extension (e.g., '.py') → counts; '' means no extension.
     """
     try:
         import json
-        base = _normalize_to_root(path)
         cnt = Counter()
-        for p in base.rglob("*"):
-            if p.is_file():
-                cnt[p.suffix or ""] += 1
-        return json.dumps(dict(sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0]))), ensure_ascii=False, indent=2)
+        base = _normalize_to_root(path)
+        for p in _iter_files_unique(base, glob_pattern, exclude.split(",")):
+            cnt[p.suffix or ""] += 1
+        return json.dumps(
+            dict(sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0]))),
+            ensure_ascii=False, indent=2
+        )
     except Exception as e:
         return f"error:{e}"
 
+@tool
+def total_file_count(
+    path: str = ".",
+    glob_pattern: str = "**/*",
+    exclude: str = ".git,.venv,__pycache__,.ipynb_checkpoints,node_modules,dist,build"
+) -> str:
+    """Count files recursively with optional exclusions.
+
+    Args:
+        path (str): Start under action folder.
+        glob_pattern (str): Include pattern (e.g., '**/*' or '**/*.py').
+        exclude (str): Comma-separated dir names to skip anywhere in the path.
+
+    Returns:
+        str: The number of files as text, or 'error:<msg>'.
+    """
+    try:
+        base = _normalize_to_root(path)
+        n = sum(1 for _ in _iter_files_unique(base, glob_pattern, exclude.split(",")))
+        return str(n)
+    except Exception as e:
+        return f"error:{e}"
 
 # --------- Tool registry ----------
-def get_tools(safe_mode: bool):
-    base = [write_file, read_text, list_dir, search_text, cwd,
-            read_pdf, read_pdf_ocr, read_image_ocr, read_docx, read_xlsx, read_csv,
-            count_files_by_type]
-    return base if safe_mode else base + [sh]
+def get_tools(safe_mode: bool, minimal: bool = True):
+    """
+    Return the list of tools exposed to the model.
+    minimal=True keeps a single obvious tool per job to reduce confusion.
+    """
+    toolset = [
+        cwd, list_dir, search_text, read_text, write_file,
+        # Single choice for PDFs: auto-detect → fallback to OCR
+        read_pdf_auto,
+        # DOCX reader (Markdown-ish)
+        read_docx,
+        # Tabular/text helpers
+        read_xlsx, read_csv,
+        # OCR for images
+        read_image_ocr,
+        # Stats
+        count_files_by_type,
+        total_file_count,
+    ]
+    return toolset if safe_mode else toolset + [sh]

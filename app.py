@@ -9,7 +9,8 @@ from app_config import TOOLS_CAPABLE
 import json
 
 import tools_local as T
-from agent_core import run_agent_message, probe_model_once
+from agent_core import run_agent_message, probe_model_once, reset_agent_cache, current_agent_meta
+
 from app_config import (
     CSS,
     PREFERRED_BACKEND,
@@ -22,7 +23,7 @@ from app_config import TOOLS_CAPABLE  # make sure this exists in app_config.py
 
 load_dotenv()
 
-with gr.Blocks(title="Local Task Agent", css=CSS, theme=gr.themes.Soft(primary_hue="emerald")) as demo:
+with gr.Blocks(title="Local Task Agent", css=CSS, theme=gr.themes.Soft(primary_hue="emerald")) as demo: # pyright: ignore[reportPrivateImportUsage]
     gr.Markdown("## Local Task Agent — API or Local LLM, folder-sandboxed")
 
     # ── Settings (top) ──────────────────────────────────────────────────────────
@@ -76,10 +77,24 @@ with gr.Blocks(title="Local Task Agent", css=CSS, theme=gr.themes.Soft(primary_h
     gr.Markdown("### Chat")
     chatbot = gr.Chatbot(label="Agent", height=420, type="messages")
     show_logs = gr.Checkbox(value=False, label="Show agent logs in replies")
+
     with gr.Row():
-        msg = gr.Textbox(label="Your message", placeholder="Type a task and press Enter", scale=5)
-        send_btn = gr.Button("Send", variant="primary", scale=1)
-        clear_btn = gr.Button("Clear", scale=1)
+        # left: message box
+        with gr.Column(scale=4):
+            msg = gr.Textbox(
+                label="Your message",
+                placeholder="Type a task and press Enter",
+            )
+
+        # right: 2x2 buttons
+        with gr.Column(scale=2):
+            with gr.Row():
+                send_btn  = gr.Button("Send", variant="primary")
+                clear_btn = gr.Button("Clear")
+            with gr.Row():
+                reset_btn = gr.Button("♻️ Reset agent ")
+                info_btn  = gr.Button("ℹ️ Agent info")
+
 
     # ===== Handlers =====
 
@@ -138,12 +153,22 @@ with gr.Blocks(title="Local Task Agent", css=CSS, theme=gr.themes.Soft(primary_h
         if TOOLS_CAPABLE.get(backend_val, True):
             # Let the agent call tools
             return (
-                "Explore the folder:\n"
-                "- List all files recursively (`**/*`)\n"
-                "- Count files by extension (JSON)\n"
-                "- Grep TODO/FIXME and show file:line\n"
-                "Write a concise overview and 3 next actions.\n"
-                "Save to `reports/folder_overview.md`."
+                "Explore this folder (and all subfolders) and produce a short, useful overview.\n"
+                "Goals (no full file tree):\n"
+                "1) Total number of files (recursively).\n"
+                "2) File counts by extension — show .json, .py, .csv, .md explicitly and group the rest as “Other”.\n"
+                "3) Find lines containing TODO or FIXME and list them as: relative/path:line: snippet (cap ~200).\n"
+                "4) Write a concise markdown report with sections:\n"
+                "# Folder Overview\n"
+                "- Action folder: …\n"
+                "- Total files: …\n"
+                "## By extension\n"
+                "| Ext | Count |\n"
+                "## TODO / FIXME\n"
+                "<file:line snippet list or “(none found)”>\n"
+                "## Next Actions (3)\n"
+                "<Actionable, specific items tied to findings>\n"
+                "Finally, print the report and save the report as `reports/folder_overview.md'create file and folder if don't exist\n"
             )
         # Prep-first (no tools)
         ctx = _gather_context_for_explore()
@@ -172,9 +197,9 @@ with gr.Blocks(title="Local Task Agent", css=CSS, theme=gr.themes.Soft(primary_h
     def preset_translate(backend_val: str) -> str:
         return (
             "Translate a document (preserve headings/lists).\n"
-            "Reply by asking me: (1) which file path, (2) target language.\n"
-            "After I answer, translate and save as Markdown next to the source "
-            "(append language code), e.g., `docs/guide_en.md`."
+            "Read the document: \n"
+            "Translate the returned Markdown to (insert language), preserve structure \n"
+            "write the result to the file e.g., 'docs/translated.md'  \n"
         )
 
     def preset_extract(backend_val: str) -> str:
@@ -211,6 +236,25 @@ with gr.Blocks(title="Local Task Agent", css=CSS, theme=gr.themes.Soft(primary_h
             "- Then execute and log to `reports/batch_log.md`."
         )
 
+    def on_reset_agent(backend_val, safe_mode_val):
+        status = reset_agent_cache(backend_val, None, safe_mode_val)  # model_id=None → auto-resolve
+        # Also clear visible chat so UI matches backend state
+        model_name = MODEL_BY_BACKEND.get(backend_val, "<auto>")
+        return [], f"🔄 {status} for {backend_val} / {model_name}"
+
+    def on_show_agent_info(backend_val, safe_mode_val):
+        meta = current_agent_meta(backend_val, None, safe_mode_val)
+        if not meta:
+            return "No agent in cache for this backend/safe-mode."
+        return (
+            f"**Agent** `{meta['id']}`  \n"
+            f"- Backend: {meta['backend']}  \n"
+            f"- Model: {meta['model']}  \n"
+            f"- Safe mode: {meta['safe_mode']}  \n"
+            f"- Created: {meta['created']}  \n"
+            f"- Steps: {meta['steps']}"
+        )
+
     # Presets: fill the message box with a task prompt
 
     btn_explore.click(lambda b: preset_explore(b), inputs=[backend], outputs=[msg])
@@ -219,6 +263,8 @@ with gr.Blocks(title="Local Task Agent", css=CSS, theme=gr.themes.Soft(primary_h
     btn_extract.click(lambda b: preset_extract(b), inputs=[backend], outputs=[msg])
     btn_generate.click(lambda b: preset_generate(b), inputs=[backend], outputs=[msg])
     btn_batch.click(lambda b, s: preset_batch(b, s), inputs=[backend, safe_mode], outputs=[msg])
+    reset_btn.click(on_reset_agent, inputs=[backend, safe_mode], outputs=[chatbot, status_md])
+    info_btn.click(on_show_agent_info, inputs=[backend, safe_mode], outputs=[status_md])
 
     # Chat submit/send
     def respond(message, history, backend_val, safe_mode_val, show_logs_val, max_steps_val):
