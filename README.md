@@ -1,7 +1,7 @@
 
 # Jarvis — Local, privacy-first AI agent
 
-**Tagline:** Jarvis is a local, file-centric AI agent. Explore folders, analyze & translate docs, extract data, generate files, and (optionally) run batch actions — via OpenRouter, Hugging Face Router, or local Ollama.
+Jarvis is a local, file-centric AI agent. Explore folders, analyze & translate docs, extract data, generate files, and (optionally) run batch actions — via OpenRouter, Hugging Face Router, or local Ollama.
 
 ---
 
